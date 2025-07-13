@@ -53,6 +53,17 @@ const documentSchema = new mongoose.Schema(
       type: Boolean,
       default: false,
     },
+  editHistory: [{
+  user: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  action: { type: String, enum: ['create', 'update'] },
+  changes: {
+    title: { type: String, required: false },
+    content: { type: String, required: false },
+    visibility: { type: String, required: false },
+    tags: { type: Array, required: false }
+  },
+  timestamp: { type: Date, default: Date.now }
+}]
   },
   {
     timestamps: true,

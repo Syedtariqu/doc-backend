@@ -5,6 +5,9 @@ const User = require("../models/User")
 const Notification = require("../models/Notification")
 const { protect } = require("../middleware/auth")
 const jwt = require("jsonwebtoken") // Import jwt
+const { generatePDF } = require("../helper/pdfService")
+const { default: puppeteer } = require("puppeteer")
+const fs = require('fs');
 
 const router = express.Router()
 
@@ -233,7 +236,7 @@ const mentionedUsers = await User.find({
 )
 
 // @route   PUT /api/documents/:id
-// @desc    Update document
+// @desc    Update document (with edit tracking)
 // @access  Private
 router.put(
   "/:id",
@@ -245,83 +248,129 @@ router.put(
   ],
   async (req, res) => {
     try {
-      const errors = validationResult(req)
+      const errors = validationResult(req);
       if (!errors.isEmpty()) {
         return res.status(400).json({
           message: "Validation failed",
           errors: errors.array(),
-        })
+        });
       }
 
-      const { hasAccess, document } = await checkDocumentAccess(req.params.id, req.user.id, "edit")
+      const { hasAccess, document } = await checkDocumentAccess(req.params.id, req.user.id, "edit");
 
       if (!hasAccess) {
-        return res.status(403).json({ message: "Access denied" })
+        return res.status(403).json({ message: "Access denied" });
       }
 
-      const { title, content, visibility, tags } = req.body
-      const updateData = {}
+      const { title, content, visibility, tags } = req.body;
+      const updateData = {};
+      const changes = {};
 
-      if (title !== undefined) updateData.title = title
-      if (content !== undefined) updateData.content = content
-      if (visibility !== undefined) updateData.visibility = visibility
-      if (tags !== undefined) updateData.tags = tags
+      if (title !== undefined && title !== document.title) {
+        updateData.title = title;
+        changes.title = title;
+      }
+      if (content !== undefined && content !== document.content) {
+        updateData.content = content;
+        changes.content = "Content updated"; // Store a summary for large content
+      }
+      if (visibility !== undefined && visibility !== document.visibility) {
+        updateData.visibility = visibility;
+        changes.visibility = visibility;
+      }
+      if (tags !== undefined && JSON.stringify(tags) !== JSON.stringify(document.tags)) {
+        updateData.tags = tags;
+        changes.tags = tags;
+      }
 
-      // Handle new mentions if content is updated
-      if (content !== undefined) {
-        const mentions = extractMentions(content)
-        if (mentions.length > 0) {
-          // const mentionedUsers = await User.find({
-          //   name: { $in: mentions },
-          // })
-          const mentionedUsers = await User.find({
-  $or: mentions.map(m => ({
-    name: new RegExp(m.split(' ')[0], 'i') // Match first part only
-  }))
-})
-console.log(mentionedUsers,"mentionedUsers");
-          for (const user of mentionedUsers) {
-            if (user._id.toString() !== req.user.id.toString()) {
-              // Check if user is already shared
-              const alreadyShared = document.sharedWith.some((share) => share.user.toString() === user._id.toString())
-
-              if (!alreadyShared) {
-                document.sharedWith.push({
-                  user: user._id,
-                  permission: "view",
-                })
-
-                // Create notification
-                await Notification.create({
-                  recipient: user._id,
-                  sender: req.user.id,
-                  type: "mention",
-                  document: document._id,
-                  message: `${req.user.name} mentioned you in "${title || document.title}"`,
-                })
-              }
-            }
+      // Only record history if something actually changed
+      if (Object.keys(changes).length > 0) {
+        updateData.$push = {
+          editHistory: {
+            user: req.user.id,
+            action: 'update',
+            changes: changes,
+            timestamp: new Date()
           }
-        }
+        };
       }
 
-      Object.assign(document, updateData)
-      await document.save()
-
-      const updatedDocument = await Document.findById(document._id)
+      const updatedDocument = await Document.findByIdAndUpdate(
+        req.params.id,
+        updateData,
+        { new: true }
+      )
         .populate("author", "name email")
         .populate("sharedWith.user", "name email")
+        .populate("editHistory.user", "name email");
 
       res.json({
         success: true,
         document: updatedDocument,
-      })
+      });
     } catch (error) {
-      console.error("Update document error:", error)
-      res.status(500).json({ message: "Server error" })
+      console.error("Update document error:", error);
+      res.status(500).json({ message: "Server error" });
     }
-  },
-)
+  }
+);
+
+
+
+// @route   GET /api/documents/:id/history
+// @desc    Get document edit history
+// @access  Private (document owner only)
+router.get("/:id/history", protect, async (req, res) => {
+  try {
+    const document = await Document.findById(req.params.id)
+      .populate("author", "name email")
+      .populate("editHistory.user", "name email")
+      .lean();
+
+    if (!document || document.isDeleted) {
+      return res.status(404).json({ message: "Document not found" });
+    }
+
+    // Only owner can see edit history
+    if (document.author._id.toString() !== req.user.id.toString()) {
+      return res.status(403).json({ message: "Not authorized" });
+    }
+
+    // Combine creation record with edit history
+    const fullHistory = [
+      {
+        user: document.author,
+        action: "create",
+        changes: {
+          title: document.title,
+          content: "Document created",
+          visibility: document.visibility,
+          tags: document.tags
+        },
+        timestamp: document.createdAt
+      },
+      ...(document.editHistory || [])
+    ];
+
+    // Sort by timestamp (newest first)
+    fullHistory.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+
+    res.json({
+      success: true,
+      history: fullHistory,
+      documentInfo: {
+        title: document.title,
+        currentVisibility: document.visibility,
+        currentTags: document.tags
+      }
+    });
+  } catch (error) {
+    console.error("Get document history error:", error);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+
 
 // @route   DELETE /api/documents/:id
 // @desc    Delete document
@@ -449,4 +498,100 @@ router.delete("/:id/share/:userId", protect, async (req, res) => {
   }
 })
 
+// @route   GET /api/documents/:id/pdf
+// @desc    Export document as PDF
+// @access  Private (or Public for public docs)
+router.get('/:id/pdf', async (req, res) => {
+  let browser;
+  try {
+    const documentId = req.params.id;
+    const userId = req.user?.id; // Assuming your middleware adds user to req
+
+    const document = await Document.findById(documentId).populate('author', 'name');
+    
+    if (!document || document.isDeleted) {
+      return res.status(404).json({ message: 'Document not found' });
+    }
+
+    // Access control
+    if (document.visibility === 'private') {
+      if (!userId) {
+        return res.status(401).json({ message: 'Authentication required' });
+      }
+      
+      const { hasAccess } = await checkDocumentAccess(documentId, userId);
+      if (!hasAccess) {
+        return res.status(403).json({ message: 'Access denied' });
+      }
+    }
+
+    // Generate HTML for PDF with basic sanitization
+    const html = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="UTF-8">
+        <title>${document.title.replace(/</g, '&lt;')}</title>
+        <style>
+          body { font-family: Arial, sans-serif; line-height: 1.6; padding: 20px; }
+          h1 { color: #333; border-bottom: 1px solid #eee; padding-bottom: 10px; }
+          .meta { color: #666; font-size: 0.9em; margin-bottom: 20px; }
+          .content { margin-top: 20px; }
+        </style>
+      </head>
+      <body>
+        <h1>${document.title.replace(/</g, '&lt;')}</h1>
+        <div class="meta">
+          <p>Author: ${document.author.name.replace(/</g, '&lt;')}</p>
+          <p>Last modified: ${new Date(document.lastModified).toLocaleString()}</p>
+        </div>
+        <div class="content">${document.content}</div>
+      </body>
+      </html>
+    `;
+
+    // Generate PDF with error handling
+    browser = await puppeteer.launch({
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox']
+    });
+    const page = await browser.newPage();
+    await page.setContent(html, { waitUntil: 'networkidle0' });
+    const pdf = await page.pdf({
+      format: 'A4',
+      printBackground: true,
+      margin: { top: '20mm', right: '20mm', bottom: '20mm', left: '20mm' }
+    });
+// fs.writeFileSync('debug-server.pdf', pdf);
+// console.log('PDF generated, size:', pdf.length, 'bytes');
+    // Validate PDF was generated
+    if (!pdf || pdf.length < 100) { // Minimum reasonable PDF size
+      throw new Error('Generated PDF is invalid');
+    }
+
+    // Sanitize filename
+    const safeFilename = document.title
+      .replace(/[^a-zA-Z0-9-_.]/g, '_')
+      .substring(0, 100); // Limit length
+
+    // Set response headers
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Length', pdf.length);
+    res.setHeader('Content-Disposition', 
+      `attachment; filename="${safeFilename}.pdf"`);
+    
+   // Send as binary data
+res.write(pdf, 'binary');
+  } catch (error) {
+    console.error('PDF generation error:', error);
+    res.status(500).json({ 
+      message: 'Failed to generate PDF',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  } finally {
+    if (browser) {
+      await browser.close();
+    }
+  }
+});
 module.exports = router
